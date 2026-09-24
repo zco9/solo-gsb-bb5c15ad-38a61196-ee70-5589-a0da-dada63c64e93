@@ -50,3 +50,27 @@ class AdBreakOut(BaseModel):
 class AdBreakResponse(BaseModel):
     breaks: list[AdBreakOut] = Field(..., description="按时间升序的插播点")
     total_silence_ms: int = Field(..., description="选中静音的总毫秒数")
+
+
+class LockIn(BaseModel):
+    word_index: int = Field(..., description="被锁定词的序号（0-based）；越界在领域校验中返回 422")
+    speaker: str = Field(..., min_length=1, description="该词必须指派的说话人标识")
+
+
+class SpeakerReconcileRequest(BaseModel):
+    words: list[WordIn] = Field(..., min_length=1, description="按时间排列的词序列（含原 speaker 标注）")
+    locks: list[LockIn] = Field(default_factory=list, description="人工锁定项；word_index 不得越界或重复")
+    switch_cost: int = Field(..., ge=0, le=10, description="相邻换人代价（0～10 的整数）")
+
+
+class WordOut(BaseModel):
+    start_ms: int
+    end_ms: int
+    text: str
+    speaker: str = Field(..., description="重新指派后的说话人标识")
+
+
+class SpeakerReconcileResponse(BaseModel):
+    words: list[WordOut] = Field(..., description="修订后的词序列：词序、文本、时间与原词完全一致")
+    changed_indices: list[int] = Field(..., description="speaker 被改动的词序号（0-based，升序）")
+    total_cost: int = Field(..., description="改动词数 + switch_cost × 相邻换人次数")

@@ -2,7 +2,8 @@
 
 接收播客转写后按时间排列的词序列，在硬约束下用**动态规划**求出总分最低的字幕分段方案，
 同时返回分段 JSON 与 SRT 字幕文本；另提供**广告插播点**接口，在词间静音处选出
-总静音最长、满足间隔约束的插播位置。基于 Python 3.12 + FastAPI。
+总静音最长、满足间隔约束的插播位置；以及**说话人对齐**接口，在人工锁定约束下
+最小化改动词数与相邻换人次数。基于 Python 3.12 + FastAPI。
 
 ## 一条命令启动
 
@@ -14,10 +15,12 @@ docker compose up --build
 
 - 分段接口：`POST http://localhost:8000/segments`
 - 广告插播点接口：`POST http://localhost:8000/ad-breaks`
+- 说话人对齐接口：`POST http://localhost:8000/speaker-reconcile`
 - 健康检查：`GET http://localhost:8000/health`
 - 交互式 API 文档（Swagger UI）：`http://localhost:8000/docs`
 
 > 不想用 Docker 时也可：`pip install -r requirements.txt && uvicorn app.main:app --host 0.0.0.0 --port 8000`
+> （同样监听 `http://localhost:8000`）
 
 ## 请求
 
@@ -213,18 +216,131 @@ curl -s http://localhost:8000/ad-breaks \
 }
 ```
 
+## 说话人对齐：`POST /speaker-reconcile`
+
+接收现有 `words`（含可能带噪点的原 `speaker` 标注）、若干人工锁定项 `locks`
+与换人代价 `switch_cost`，在**不改词序、文本、时间**且严格满足锁定的前提下，
+为每个词重新指派说话人，最小化：
+
+```
+总成本 = 改动原 speaker 的词数 + switch_cost × 相邻换人次数
+```
+
+候选说话人取“原词 speaker”与“锁定 speaker”的**并集**，排序后作为说话人字母表
+（至多 **8** 个，超出返回 422）。总成本相同时，取**整条说话人序列字典序最小**
+（按字母表逐位比较）的方案。`words` 字段与 `/segments` 完全相同，并沿用同一套
+词序与时间校验（422 错误码一致）。
+
+### 请求
+
+`POST /speaker-reconcile`，`Content-Type: application/json`
+
+```json
+{
+  "words": [
+    {"start_ms": 0,    "end_ms": 500,  "text": "今", "speaker": "A"},
+    {"start_ms": 600,  "end_ms": 1100, "text": "天", "speaker": "B"},
+    {"start_ms": 1200, "end_ms": 1700, "text": "聊", "speaker": "A"},
+    {"start_ms": 1800, "end_ms": 2300, "text": "聊", "speaker": "B"},
+    {"start_ms": 2400, "end_ms": 2900, "text": "天", "speaker": "A"}
+  ],
+  "locks": [],
+  "switch_cost": 3
+}
+```
+
+字段说明（`words` 之外）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `locks` | 数组，可空（默认 `[]`） | 人工锁定项，每项含 `word_index`（0-based 词序号）与非空 `speaker`；该词必须指派为指定说话人。索引越界、`word_index` 重复均返回 422 |
+| `switch_cost` | 整数，**0～10** | 每发生一次相邻换人计入的代价；`0` 时换人免费（等价于只执行锁定、不平滑原标注），值越大越倾向抹平碎标注 |
+
+### 规则
+
+1. **硬约束**：每个锁定词的说话人必须等于锁定值；词序、`text`、`start_ms`、
+   `end_ms` 原样保留，接口只重写 `speaker`；
+2. **候选说话人**：原词 speaker 与所有锁定 speaker 的并集（排序去重），
+   最多 8 个——锁定可以引入原标注中没有的新说话人；
+3. **目标**：最小化「改动词数 + `switch_cost` × 相邻换人次数」；
+4. **同分裁决**：整条说话人序列按字母表的标准字典序最小者
+   （例如字母表 `A < B < C` 时，成本相同优先把靠前的词指派为 `A`）；
+5. `locks` 为空时也会平滑原标注（当 `switch_cost > 0`）；不存在“无解”情况
+   （锁定本身永远可满足），仅在输入非法时返回 422。
+
+### 响应示例（200，空 locks 平滑碎标注）
+
+原标注 `A B A B A` 有 4 次换人（`4 × 3 = 12`）；抹平为全 `A` 只需改动词 1、3
+（成本 2、0 次换人），故最优：
+
+```json
+{
+  "words": [
+    {"start_ms": 0,    "end_ms": 500,  "text": "今", "speaker": "A"},
+    {"start_ms": 600,  "end_ms": 1100, "text": "天", "speaker": "A"},
+    {"start_ms": 1200, "end_ms": 1700, "text": "聊", "speaker": "A"},
+    {"start_ms": 1800, "end_ms": 2300, "text": "聊", "speaker": "A"},
+    {"start_ms": 2400, "end_ms": 2900, "text": "天", "speaker": "A"}
+  ],
+  "changed_indices": [1, 3],
+  "total_cost": 2
+}
+```
+
+### 带人工锁定的示例
+
+同一批词，锁定词 2 为 `C`（原标注中没有的新说话人），`switch_cost=10`：
+
+```bash
+curl -s http://localhost:8000/speaker-reconcile \
+  -H 'Content-Type: application/json' \
+  -d '{"words":[{"start_ms":0,"end_ms":500,"text":"今","speaker":"A"},{"start_ms":600,"end_ms":1100,"text":"天","speaker":"B"},{"start_ms":1200,"end_ms":1700,"text":"聊","speaker":"A"},{"start_ms":1800,"end_ms":2300,"text":"聊","speaker":"B"},{"start_ms":2400,"end_ms":2900,"text":"天","speaker":"A"}],"locks":[{"word_index":2,"speaker":"C"}],"switch_cost":10}'
+```
+
+换人代价很高，最优是把整段都归给被锁定的 `C`：改 5 个词、0 次换人，
+`total_cost=5`（任何保留 `A`/`B` 的方案至少引入两次换人，成本 ≥ 20）：
+
+```json
+{
+  "words": [
+    {"start_ms": 0,    "end_ms": 500,  "text": "今", "speaker": "C"},
+    {"start_ms": 600,  "end_ms": 1100, "text": "天", "speaker": "C"},
+    {"start_ms": 1200, "end_ms": 1700, "text": "聊", "speaker": "C"},
+    {"start_ms": 1800, "end_ms": 2300, "text": "聊", "speaker": "C"},
+    {"start_ms": 2400, "end_ms": 2900, "text": "天", "speaker": "C"}
+  ],
+  "changed_indices": [0, 1, 2, 3, 4],
+  "total_cost": 5
+}
+```
+
+> `changed_indices` 为 speaker 实际被改动的词序号（0-based、升序）；
+> 锁定词若与原 speaker 相同则不计入。`total_cost` 恒等于
+> `len(changed_indices) + switch_cost × 输出序列的相邻换人次数`。
+
+### curl 示例（空 locks）
+
+```bash
+curl -s http://localhost:8000/speaker-reconcile \
+  -H 'Content-Type: application/json' \
+  -d '{"words":[{"start_ms":0,"end_ms":500,"text":"今","speaker":"A"},{"start_ms":600,"end_ms":1100,"text":"天","speaker":"B"},{"start_ms":1200,"end_ms":1700,"text":"聊","speaker":"A"},{"start_ms":1800,"end_ms":2300,"text":"聊","speaker":"B"},{"start_ms":2400,"end_ms":2900,"text":"天","speaker":"A"}],"locks":[],"switch_cost":3}'
+```
+
 ## 错误响应（HTTP 422）
 
 统一形如：`{"error": {"code": "...", "message": "...", ...}}`
 
 | `code` | 触发条件 | 附加字段 |
 | --- | --- | --- |
-| `invalid_request` | 请求体结构/字段类型不合法（含空 `words`） | `errors` |
+| `invalid_request` | 请求体结构/字段类型不合法（含空 `words`、`switch_cost` 越界、`locks` 项缺字段） | `errors` |
 | `invalid_time_range` | 某个词 `end_ms < start_ms` | `word_index` |
 | `time_out_of_order` | 相邻词 `start_ms` 倒序 | `word_index` |
 | `overlapping_time_range` | 某词 `start_ms` 早于前词 `end_ms`（重叠） | `word_index` |
 | `infeasible_segmentation` | 不存在满足全部约束的分段 | `last_word_index` |
 | `infeasible_ad_breaks` | 不存在满足全部约束的插播方案 | `break_count`、`candidate_count` |
+| `lock_index_out_of_range` | `/speaker-reconcile` 锁定项 `word_index` 不在 `[0, n-1]` | `word_index`、`lock_position`、`word_count` |
+| `duplicate_lock` | `/speaker-reconcile` 两个锁定项引用同一 `word_index` | `word_index` |
+| `too_many_speakers` | `/speaker-reconcile` 候选说话人并集超过 8 个 | `speaker_count`、`max_speakers` |
 
 ### 无可行分段
 
@@ -250,6 +366,28 @@ curl -s http://localhost:8000/segments \
 
 （该词仅 800ms 且无法与前后词组合成 ≥1000ms 的段。）
 
+### 说话人对齐的非法输入
+
+`word_index` 越界（含负数）、重复锁定、候选说话人超过 8 个均返回 422：
+
+```bash
+curl -s http://localhost:8000/speaker-reconcile \
+  -H 'Content-Type: application/json' \
+  -d '{"words":[{"start_ms":0,"end_ms":500,"text":"甲","speaker":"A"},{"start_ms":600,"end_ms":1100,"text":"乙","speaker":"B"}],"locks":[{"word_index":2,"speaker":"A"}],"switch_cost":1}'
+```
+
+```json
+{
+  "error": {
+    "code": "lock_index_out_of_range",
+    "message": "第 0 个锁定项的 word_index(2) 超出范围 [0, 1]",
+    "word_index": 2,
+    "lock_position": 0,
+    "word_count": 2
+  }
+}
+```
+
 ## 算法说明
 
 两趟动态规划 + 贪心重建，**O(n) 时间、O(n) 空间**：
@@ -274,6 +412,19 @@ curl -s http://localhost:8000/segments \
 “恰选 j 个”分层做后缀最大 DP，最后从左向右贪心重建——每步取仍能达成
 最优总静音的最小下标，即得字典序最小的时间序列。
 
+说话人对齐（`speaker_reconcile.py`）为后向 DP + 贪心重建，
+**O(n·k²) 时间、O(n·k) 空间**（k ≤ 8 为候选说话人数）：
+
+1. 候选说话人取原标注与锁定值的并集并排序，锁定词只允许唯一候选；
+2. `bwd[i][p]` = 词 i 固定为 speaker[p] 时后缀 `[i,n)` 的最优成本，
+   转移在至多 8 个候选中枚举词 i+1 的说话人，计入改动词成本
+   （与原 speaker 不同为 1）与换人代价 `switch_cost`；
+3. 最优总成本为 `min_p bwd[0][p]`。重建时从左向右扫描候选（字母表升序），
+   取第一个满足“前缀成本 + 换人代价 + bwd[i][q] == 最优”的说话人——
+   任何最优序列在该位置都必须满足此等式，故逐位取字母表最小者即得
+   整条说话人序列字典序最小的方案。锁定恒可满足，因此不存在“无解”，
+   仅输入校验失败时返回 422。
+
 ## 测试
 
 核心算法只依赖 Python 标准库，无需安装任何第三方包即可运行：
@@ -293,15 +444,17 @@ docker compose run --rm api python -m unittest discover -s tests -v
 ```
 app/
   __init__.py
-  main.py          # FastAPI 路由、异常处理（422 统一错误体）
-  schemas.py       # 请求/响应 Pydantic 模型
-  segmentation.py  # 输入校验 + 动态规划核心（纯标准库）
-  ad_breaks.py     # 广告插播点选择（纯标准库，复用同一套输入校验）
-  srt.py           # SRT 渲染
-  errors.py        # DomainError
-tests/             # unittest：核心算法、暴力对拍、HTTP 接口层
+  main.py               # FastAPI 路由、异常处理（422 统一错误体）
+  schemas.py            # 请求/响应 Pydantic 模型
+  segmentation.py       # 输入校验 + 动态规划核心（纯标准库）
+  ad_breaks.py          # 广告插播点选择（纯标准库，复用同一套输入校验）
+  speaker_reconcile.py  # 说话人对齐：后向 DP + 字典序贪心重建（纯标准库）
+  srt.py                # SRT 渲染
+  errors.py             # DomainError
+tests/                  # unittest：核心算法、暴力对拍、HTTP 接口层
   test_segmentation.py
   test_ad_breaks.py
+  test_speaker_reconcile.py
   test_differential.py
   test_api.py
 Dockerfile
