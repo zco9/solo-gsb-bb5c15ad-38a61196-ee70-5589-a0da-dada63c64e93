@@ -2,7 +2,8 @@
 
 接收播客转写后按时间排列的词序列，在硬约束下用**动态规划**求出总分最低的字幕分段方案，
 同时返回分段 JSON 与 SRT 字幕文本；另提供**广告插播点**接口，在词间静音处选出
-总静音最长、满足间隔约束的插播位置。基于 Python 3.12 + FastAPI。
+总静音最长、满足间隔约束的插播位置，以及**说话人校正**接口，在人工锁定约束下
+以最小代价重指派说话人。基于 Python 3.12 + FastAPI。
 
 ## 一条命令启动
 
@@ -14,6 +15,7 @@ docker compose up --build
 
 - 分段接口：`POST http://localhost:8000/segments`
 - 广告插播点接口：`POST http://localhost:8000/ad-breaks`
+- 说话人校正接口：`POST http://localhost:8000/speaker-reconcile`
 - 健康检查：`GET http://localhost:8000/health`
 - 交互式 API 文档（Swagger UI）：`http://localhost:8000/docs`
 
@@ -213,18 +215,86 @@ curl -s http://localhost:8000/ad-breaks \
 }
 ```
 
+## 说话人校正：`POST /speaker-reconcile`
+
+在**严格满足人工锁定**、且不改词序/文本/时间的前提下，为每个词重新指派说话人，
+使总成本最小。`words` 字段与 `/segments` 完全相同，并沿用同一套词序与时间校验
+（422 错误码一致）。
+
+```json
+{
+  "words": [
+    {"start_ms": 0,    "end_ms": 1800, "text": "大家好。",   "speaker": "A"},
+    {"start_ms": 1800, "end_ms": 3600, "text": "我是小明。", "speaker": "A"},
+    {"start_ms": 3600, "end_ms": 5400, "text": "谢谢。",     "speaker": "B"},
+    {"start_ms": 5400, "end_ms": 7200, "text": "下期再见。", "speaker": "A"}
+  ],
+  "locks": [{"word_index": 2, "speaker": "B"}],
+  "switch_cost": 2
+}
+```
+
+字段说明（`words` 之外）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `locks` | 数组，可空/可省略 | 人工锁定项，每项含 `word_index`（0-based 词序号）与非空 `speaker`；该词必须指派为该说话人 |
+| `switch_cost` | 整数，0～10 | 相邻换人的单位代价 |
+
+### 校正规则
+
+1. **候选说话人**：取原词 `speaker` 与锁定值的并集，**至多 8 个**，超限返回 422
+   （`too_many_speakers`）；锁定可以引入原序列中不存在的新说话人；
+2. **硬约束**：锁定词严格取锁定值；词序、文本、时间一律不变；
+3. **目标**：最小化 `改动原 speaker 的词数 + switch_cost × 相邻换人次数`；
+4. **同成本裁决**：取整条说话人序列**字典序最小**者；
+5. `locks` 为空数组或省略时即对原标注做平滑（例如开关成本较高时，孤立的
+   单人插话会被并入相邻说话人）；
+6. 锁定索引越界（含负数）、同一 `word_index` 重复锁定均返回 422。
+
+### 响应示例（200）
+
+```json
+{
+  "words": [
+    {"start_ms": 0,    "end_ms": 1800, "text": "大家好。",   "speaker": "A"},
+    {"start_ms": 1800, "end_ms": 3600, "text": "我是小明。", "speaker": "A"},
+    {"start_ms": 3600, "end_ms": 5400, "text": "谢谢。",     "speaker": "B"},
+    {"start_ms": 5400, "end_ms": 7200, "text": "下期再见。", "speaker": "B"}
+  ],
+  "changed_word_indices": [3],
+  "total_cost": 3
+}
+```
+
+> 上例锁定词 2 为 `B`。保留原标注 `AABA` 需 2 次相邻换人（成本 4）；把词 3 也
+> 改为 `B`（`AABB`）只需 1 次改动 + 1 次换人（成本 3）；全部改为 `B`（`BBBB`）
+> 需 3 次改动（成本也是 3）——同成本取字典序最小的 `AABB`。
+> `changed_word_indices` 为说话人被改动的词序号（0-based，升序）。
+
+### curl 示例
+
+```bash
+curl -s http://localhost:8000/speaker-reconcile \
+  -H 'Content-Type: application/json' \
+  -d '{"words":[{"start_ms":0,"end_ms":1800,"text":"大家好。","speaker":"A"},{"start_ms":1800,"end_ms":3600,"text":"我是小明。","speaker":"A"},{"start_ms":3600,"end_ms":5400,"text":"谢谢。","speaker":"B"},{"start_ms":5400,"end_ms":7200,"text":"下期再见。","speaker":"A"}],"locks":[{"word_index":2,"speaker":"B"}],"switch_cost":2}'
+```
+
 ## 错误响应（HTTP 422）
 
 统一形如：`{"error": {"code": "...", "message": "...", ...}}`
 
 | `code` | 触发条件 | 附加字段 |
 | --- | --- | --- |
-| `invalid_request` | 请求体结构/字段类型不合法（含空 `words`） | `errors` |
+| `invalid_request` | 请求体结构/字段类型不合法（含空 `words`、`switch_cost` 越界） | `errors` |
 | `invalid_time_range` | 某个词 `end_ms < start_ms` | `word_index` |
 | `time_out_of_order` | 相邻词 `start_ms` 倒序 | `word_index` |
 | `overlapping_time_range` | 某词 `start_ms` 早于前词 `end_ms`（重叠） | `word_index` |
 | `infeasible_segmentation` | 不存在满足全部约束的分段 | `last_word_index` |
 | `infeasible_ad_breaks` | 不存在满足全部约束的插播方案 | `break_count`、`candidate_count` |
+| `lock_index_out_of_range` | 锁定词序号越界（含负数） | `word_index` |
+| `duplicate_lock` | 同一词序号被重复锁定 | `word_index` |
+| `too_many_speakers` | 候选说话人（原标注 ∪ 锁定值）超过 8 个 | `speaker_count` |
 
 ### 无可行分段
 
@@ -274,6 +344,13 @@ curl -s http://localhost:8000/segments \
 “恰选 j 个”分层做后缀最大 DP，最后从左向右贪心重建——每步取仍能达成
 最优总静音的最小下标，即得字典序最小的时间序列。
 
+说话人校正（`speaker_reconcile.py`）也是动态规划，**O(n·m) 时间/空间**
+（m 为候选说话人数，≤ 8）：`bwd[i][k]` 表示词 i 指派为第 k 个候选说话人时
+后缀 `[i, n)` 的最小代价（含词 i 的改动代价与其后全部换人代价），锁定词只
+允许取锁定值。转移利用“不换人代价为 0、换人统一为 `switch_cost`”的结构，
+每行预求最小值与次小值即可 O(m) 完成；重建阶段从左向右贪心，每步在仍能
+达到最优总成本的候选中取字典序最小的说话人，归纳可得整条序列字典序最小。
+
 ## 测试
 
 核心算法只依赖 Python 标准库，无需安装任何第三方包即可运行：
@@ -293,15 +370,17 @@ docker compose run --rm api python -m unittest discover -s tests -v
 ```
 app/
   __init__.py
-  main.py          # FastAPI 路由、异常处理（422 统一错误体）
-  schemas.py       # 请求/响应 Pydantic 模型
-  segmentation.py  # 输入校验 + 动态规划核心（纯标准库）
-  ad_breaks.py     # 广告插播点选择（纯标准库，复用同一套输入校验）
-  srt.py           # SRT 渲染
-  errors.py        # DomainError
+  main.py               # FastAPI 路由、异常处理（422 统一错误体）
+  schemas.py            # 请求/响应 Pydantic 模型
+  segmentation.py       # 输入校验 + 动态规划核心（纯标准库）
+  ad_breaks.py          # 广告插播点选择（纯标准库，复用同一套输入校验）
+  speaker_reconcile.py  # 说话人校正（纯标准库，复用同一套输入校验）
+  srt.py                # SRT 渲染
+  errors.py             # DomainError
 tests/             # unittest：核心算法、暴力对拍、HTTP 接口层
   test_segmentation.py
   test_ad_breaks.py
+  test_speaker_reconcile.py
   test_differential.py
   test_api.py
 Dockerfile

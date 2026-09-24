@@ -177,5 +177,106 @@ class AdBreakApiTests(unittest.TestCase):
         self.assertIn("segments", resp.json())
 
 
+@unittest.skipUnless(_HAS_DEPS, "fastapi/httpx 未安装，跳过接口层测试")
+class SpeakerReconcileApiTests(unittest.TestCase):
+    WORDS = [
+        {"start_ms": 0, "end_ms": 500, "text": "甲", "speaker": "A"},
+        {"start_ms": 500, "end_ms": 1000, "text": "乙", "speaker": "A"},
+        {"start_ms": 1000, "end_ms": 1500, "text": "丙", "speaker": "B"},
+        {"start_ms": 1500, "end_ms": 2000, "text": "丁", "speaker": "A"},
+    ]
+
+    def setUp(self):
+        self.client = TestClient(app)
+
+    def post(self, **overrides):
+        payload = {"words": self.WORDS, "locks": [], "switch_cost": 5}
+        payload.update(overrides)
+        return self.client.post("/speaker-reconcile", json=payload)
+
+    def test_basic_reconcile_smooths(self):
+        # A A B A，switch_cost=5：保留原标注需 2 次换人（成本 10），
+        # 词 2 改为 A 仅 1 次改动（成本 1）
+        resp = self.post()
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual([w["speaker"] for w in data["words"]], ["A"] * 4)
+        self.assertEqual(data["changed_word_indices"], [2])
+        self.assertEqual(data["total_cost"], 1)
+        # 词序、文本、时间不变
+        self.assertEqual(
+            [(w["start_ms"], w["end_ms"], w["text"]) for w in data["words"]],
+            [(0, 500, "甲"), (500, 1000, "乙"), (1000, 1500, "丙"), (1500, 2000, "丁")],
+        )
+
+    def test_lock_respected(self):
+        # 锁定词 2 为 B，switch_cost=2：AABB 与 BBBB 同为成本 3，取字典序小的 AABB
+        resp = self.post(locks=[{"word_index": 2, "speaker": "B"}], switch_cost=2)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual([w["speaker"] for w in data["words"]], ["A", "A", "B", "B"])
+        self.assertEqual(data["changed_word_indices"], [3])
+        self.assertEqual(data["total_cost"], 3)
+
+    def test_lock_can_introduce_new_speaker(self):
+        resp = self.post(locks=[{"word_index": 0, "speaker": "C"}], switch_cost=0)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["words"][0]["speaker"], "C")
+        self.assertEqual(data["changed_word_indices"], [0])
+        self.assertEqual(data["total_cost"], 1)
+
+    def test_locks_may_be_omitted(self):
+        resp = self.client.post(
+            "/speaker-reconcile",
+            json={"words": self.WORDS, "switch_cost": 5},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["changed_word_indices"], [2])
+
+    def test_lock_index_out_of_range(self):
+        for bad in (4, -1):
+            resp = self.post(locks=[{"word_index": bad, "speaker": "A"}])
+            self.assertEqual(resp.status_code, 422)
+            err = resp.json()["error"]
+            self.assertEqual(err["code"], "lock_index_out_of_range")
+            self.assertEqual(err["word_index"], bad)
+
+    def test_duplicate_lock(self):
+        resp = self.post(
+            locks=[{"word_index": 1, "speaker": "A"}, {"word_index": 1, "speaker": "B"}]
+        )
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "duplicate_lock")
+
+    def test_too_many_speakers(self):
+        words = [
+            {"start_ms": i * 500, "end_ms": (i + 1) * 500, "text": "字", "speaker": s}
+            for i, s in enumerate("ABCDEFGH")
+        ]
+        resp = self.post(words=words, locks=[{"word_index": 0, "speaker": "Z"}])
+        self.assertEqual(resp.status_code, 422)
+        err = resp.json()["error"]
+        self.assertEqual(err["code"], "too_many_speakers")
+        self.assertEqual(err["speaker_count"], 9)
+
+    def test_switch_cost_out_of_range(self):
+        for bad in (-1, 11):
+            resp = self.post(switch_cost=bad)
+            self.assertEqual(resp.status_code, 422)
+            self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+
+    def test_lock_schema_invalid(self):
+        resp = self.post(locks=[{"word_index": 0}])  # 缺 speaker
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+
+    def test_word_validation_reused(self):
+        words = [dict(self.WORDS[1]), dict(self.WORDS[0])]  # 时间倒序
+        resp = self.post(words=words)
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "time_out_of_order")
+
+
 if __name__ == "__main__":
     unittest.main()
